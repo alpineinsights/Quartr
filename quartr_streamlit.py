@@ -14,6 +14,34 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Function to get environment variables with fallback to st.secrets
+def get_env_variable(key: str, secret_section: str = None, secret_key: str = None) -> str:
+    # First try Railway environment variable
+    value = os.getenv(key)
+    if value:
+        return value
+        
+    # Fallback to Streamlit secrets if available
+    if secret_section and secret_key:
+        try:
+            return st.secrets[secret_section][secret_key]
+        except Exception:
+            pass
+            
+    return None
+
+# Environment variables configuration
+QUARTR_API_KEY = get_env_variable("QUARTR_API_KEY", "quartr", "API_KEY")
+AWS_ACCESS_KEY_ID = get_env_variable("AWS_ACCESS_KEY_ID", "aws", "AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = get_env_variable("AWS_SECRET_ACCESS_KEY", "aws", "AWS_SECRET_ACCESS_KEY")
+AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION", "aws", "AWS_DEFAULT_REGION")
+DEFAULT_S3_BUCKET = get_env_variable("DEFAULT_S3_BUCKET", "s3", "DEFAULT_BUCKET")
 
 # Page configuration
 st.set_page_config(
@@ -30,7 +58,9 @@ if 'processed_files' not in st.session_state:
 
 class QuartrAPI:
     def __init__(self):
-        self.api_key = st.secrets["quartr"]["API_KEY"]
+        if not QUARTR_API_KEY:
+            raise ValueError("Quartr API key not found in environment variables")
+        self.api_key = QUARTR_API_KEY
         self.base_url = "https://api.quartr.com/public/v1"
         self.headers = {"X-Api-Key": self.api_key}
         
@@ -46,6 +76,7 @@ class QuartrAPI:
         except Exception as e:
             st.error(f"Error fetching data for ISIN {isin}: {str(e)}")
             return {}
+
 class TranscriptProcessor:
     @staticmethod
     async def process_transcript(transcript_url: str, transcripts: Dict, session: aiohttp.ClientSession) -> str:
@@ -61,9 +92,7 @@ class TranscriptProcessor:
                     if 'application/json' in response.headers.get('Content-Type', ''):
                         try:
                             transcript_data = await response.json()
-                            # Process the transcript text to properly handle line breaks
                             text = transcript_data.get('transcript', {}).get('text', '')
-                            # Split by sentences and add proper line breaks
                             sentences = text.split('. ')
                             formatted_text = '.\n'.join(sentences)
                             return formatted_text
@@ -116,7 +145,6 @@ class TranscriptProcessor:
 
         story = []
         
-        # Add header
         header_text = f"""
             <para alignment="center">
             <b>{company_name}</b><br/>
@@ -128,7 +156,6 @@ class TranscriptProcessor:
         story.append(Paragraph(header_text, header_style))
         story.append(Spacer(1, 30))
 
-        # Process transcript text
         paragraphs = transcript_text.split('\n')
         for para in paragraphs:
             if para.strip():
@@ -140,10 +167,13 @@ class TranscriptProcessor:
 
 class S3Handler:
     def __init__(self):
+        if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION]):
+            raise ValueError("AWS credentials not found in environment variables")
+        
         self.session = aioboto3.Session(
-            aws_access_key_id=st.secrets["aws"]["AWS_ACCESS_KEY_ID"],
-            aws_secret_access_key=st.secrets["aws"]["AWS_SECRET_ACCESS_KEY"],
-            region_name=st.secrets["aws"]["AWS_DEFAULT_REGION"]
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_DEFAULT_REGION
         )
 
     async def upload_file(self, file_data: bytes, s3_key: str, bucket_name: str, 
@@ -338,6 +368,18 @@ async def process_documents(isin_list: List[str], start_date: str, end_date: str
 def main():
     st.title("Quartr Data Retrieval and S3 Upload")
     
+    # Validate environment variables
+    if not all([QUARTR_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION]):
+        st.error("""
+        Missing required environment variables. Please ensure the following are set in Railway:
+        - QUARTR_API_KEY
+        - AWS_ACCESS_KEY_ID
+        - AWS_SECRET_ACCESS_KEY
+        - AWS_DEFAULT_REGION
+        - DEFAULT_S3_BUCKET (optional)
+        """)
+        return
+    
     # Example ISINs
     st.sidebar.header("Help")
     st.sidebar.markdown("""
@@ -379,16 +421,9 @@ def main():
             help="Choose which types of documents to retrieve"
         )
         
-        # Get default bucket from secrets with fallback
-        default_bucket = ""
-        try:
-            default_bucket = st.secrets["s3"]["DEFAULT_BUCKET"]
-        except Exception:
-            st.warning("No default bucket configured in secrets.toml")
-            
         s3_bucket = st.text_input(
             "S3 Bucket Name",
-            value=default_bucket,
+            value=DEFAULT_S3_BUCKET or "",
             help="Enter the name of the S3 bucket for file upload"
         )
         
@@ -423,3 +458,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
