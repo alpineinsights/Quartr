@@ -1,4 +1,11 @@
 import streamlit as st
+# Set page config must be the first Streamlit command
+st.set_page_config(
+    page_title="Quartr Data Retrieval",
+    page_icon="📊",
+    layout="wide"
+)
+
 import boto3
 import requests
 import json
@@ -20,35 +27,16 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Function to get environment variables with fallback to st.secrets
-def get_env_variable(key: str, secret_section: str = None, secret_key: str = None) -> str:
-    # First try Railway environment variable
-    value = os.getenv(key)
-    if value:
-        return value
-        
-    # Fallback to Streamlit secrets if available
-    if secret_section and secret_key:
-        try:
-            return st.secrets[secret_section][secret_key]
-        except Exception:
-            pass
-            
-    return None
+# Function to get environment variables (prioritize Railway env vars)
+def get_env_variable(key: str) -> str:
+    return os.getenv(key)
 
-# Environment variables configuration
-QUARTR_API_KEY = get_env_variable("QUARTR_API_KEY", "quartr", "API_KEY")
-AWS_ACCESS_KEY_ID = get_env_variable("AWS_ACCESS_KEY_ID", "aws", "AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = get_env_variable("AWS_SECRET_ACCESS_KEY", "aws", "AWS_SECRET_ACCESS_KEY")
-AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION", "aws", "AWS_DEFAULT_REGION")
-DEFAULT_S3_BUCKET = get_env_variable("DEFAULT_S3_BUCKET", "s3", "DEFAULT_BUCKET")
-
-# Page configuration
-st.set_page_config(
-    page_title="Quartr Data Retrieval",
-    page_icon="📊",
-    layout="wide"
-)
+# Environment variables configuration - only use environment variables, no secrets
+QUARTR_API_KEY = get_env_variable("QUARTR_API_KEY")
+AWS_ACCESS_KEY_ID = get_env_variable("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = get_env_variable("AWS_SECRET_ACCESS_KEY")
+AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION")
+DEFAULT_S3_BUCKET = get_env_variable("DEFAULT_S3_BUCKET")
 
 # Initialize session state
 if 'processing_complete' not in st.session_state:
