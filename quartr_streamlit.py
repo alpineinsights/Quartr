@@ -164,13 +164,15 @@ class S3Handler:
             region_name=AWS_DEFAULT_REGION
         )
 
-    async def upload_file(self, file_data: bytes, s3_key: str, bucket_name: str, 
+    async def upload_file(self, file_data: bytes, filename: str, bucket_name: str, 
                          content_type: str = 'application/pdf'):
+        """Modified upload_file to use flat structure without folders"""
         try:
             async with self.session.client('s3') as s3:
+                # Use only the filename as the key, without folder structure
                 await s3.put_object(
                     Bucket=bucket_name,
-                    Key=s3_key,
+                    Key=filename,
                     Body=file_data,
                     ContentType=content_type
                 )
@@ -179,12 +181,18 @@ class S3Handler:
             st.error(f"Error uploading to S3: {str(e)}")
             return False
 
-def format_s3_key(company_name: str, date: str, doc_type: str, filename: str) -> str:
-    """Format S3 key with proper naming convention"""
+def create_filename(company_name: str, event_date: str, event_title: str, doc_type: str, original_filename: str) -> str:
+    """Create a flat filename structure"""
+    # Clean up company name and event title
     clean_company = company_name.replace(" ", "_").replace("/", "_").lower()
-    clean_date = date.split("T")[0]
-    clean_filename = filename.replace(" ", "_").lower()
-    return f"{clean_company}/{clean_date}/{doc_type}/{clean_filename}"
+    clean_event = event_title.replace(" ", "_").lower()
+    clean_date = event_date.split("T")[0]
+    
+    # Get file extension from original filename
+    file_extension = original_filename.split('.')[-1].lower()
+    
+    # Create a flat filename
+    return f"{clean_company}_{clean_date}_{clean_event}_{doc_type}.{file_extension}"
 
 async def process_documents(isin_list: List[str], start_date: str, end_date: str, 
                           selected_docs: List[str], bucket_name: str):
@@ -273,16 +281,17 @@ async def process_documents(isin_list: List[str], start_date: str, end_date: str
                                                 transcript_text
                                             )
                                             
-                                            s3_key = format_s3_key(
+                                            filename = create_filename(
                                                 company_name,
                                                 event_date,
+                                                event_title,
                                                 doc_type,
-                                                f"{event_title.lower().replace(' ', '_')}_transcript.pdf"
+                                                'transcript.pdf'
                                             )
                                             
                                             success = await s3_handler.upload_file(
                                                 pdf_bytes,
-                                                s3_key,
+                                                filename,
                                                 bucket_name
                                             )
                                 elif doc_type == 'audio':
@@ -291,16 +300,17 @@ async def process_documents(isin_list: List[str], start_date: str, end_date: str
                                         if response.status == 200:
                                             content = await response.read()
                                             file_extension = file_url.split('.')[-1].lower()
-                                            s3_key = format_s3_key(
+                                            filename = create_filename(
                                                 company_name,
                                                 event_date,
+                                                event_title,
                                                 doc_type,
-                                                f"{event_title.lower().replace(' ', '_')}.{file_extension}"
+                                                f"audio.{file_extension}"
                                             )
                                             content_type = 'audio/mpeg' if file_extension == 'mpeg' else 'audio/mp3'
                                             success = await s3_handler.upload_file(
                                                 content,
-                                                s3_key,
+                                                filename,
                                                 bucket_name,
                                                 content_type
                                             )
@@ -309,15 +319,17 @@ async def process_documents(isin_list: List[str], start_date: str, end_date: str
                                     async with session.get(file_url) as response:
                                         if response.status == 200:
                                             content = await response.read()
-                                            s3_key = format_s3_key(
+                                            original_filename = file_url.split('/')[-1]
+                                            filename = create_filename(
                                                 company_name,
                                                 event_date,
+                                                event_title,
                                                 doc_type,
-                                                file_url.split('/')[-1]
+                                                original_filename
                                             )
                                             success = await s3_handler.upload_file(
                                                 content,
-                                                s3_key,
+                                                filename,
                                                 bucket_name,
                                                 response.headers.get('content-type', 'application/pdf')
                                             )
@@ -402,10 +414,11 @@ def main():
                 max_value=datetime(2025, 12, 31)
             )
         
+        # All document types selected by default
         doc_types = st.multiselect(
             "Select document types",
             ["slides", "report", "transcript", "audio"],
-            default=["slides", "report", "transcript"],
+            default=["slides", "report", "transcript", "audio"],  # All types selected by default
             help="Choose which types of documents to retrieve"
         )
         
