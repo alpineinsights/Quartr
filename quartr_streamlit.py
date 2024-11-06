@@ -1,462 +1,244 @@
-import streamlit as st
-# Set page config must be the first Streamlit command
-st.set_page_config(
-    page_title="Quartr Data Retrieval",
-    page_icon="📊",
-    layout="wide"
-)
+    import streamlit as st
+    # Set page config must be the first Streamlit command
+    st.set_page_config(page_title="Quartr Data Retrieval", page_icon="📊", layout="wide")
 
-import boto3
-import requests
-import json
-from datetime import datetime
-import pandas as pd
-import asyncio
-import aiohttp
-import aioboto3
-from typing import List, Dict, Any
-import io
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-import os
-from dotenv import load_dotenv
+    # Import tasks first
+    from tasks import huey, process_files_task, process_single_file
+    from utils import QuartrAPI, TranscriptProcessor, S3Handler
 
-# Load environment variables
-load_dotenv()
+    # Then other imports
+    from streamlit_autorefresh import st_autorefresh
+    import boto3
+    import requests
+    import json
+    from datetime import datetime
+    import pandas as pd
+    import asyncio
+    import aiohttp
+    import aioboto3
+    from typing import List, Dict, Any
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    import os
+    from dotenv import load_dotenv
 
-# Function to get environment variables (prioritize Railway env vars)
-def get_env_variable(key: str) -> str:
-    return os.getenv(key)
+    # Load environment variables
+    load_dotenv()
 
-# Environment variables configuration - only use environment variables, no secrets
-QUARTR_API_KEY = get_env_variable("QUARTR_API_KEY")
-AWS_ACCESS_KEY_ID = get_env_variable("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = get_env_variable("AWS_SECRET_ACCESS_KEY")
-AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION")
-DEFAULT_S3_BUCKET = get_env_variable("DEFAULT_S3_BUCKET")
+    # Function to get environment variables
+    def get_env_variable(key: str) -> str:
+        return os.getenv(key)
 
-# Initialize session state
-if 'processing_complete' not in st.session_state:
-    st.session_state.processing_complete = False
-if 'processed_files' not in st.session_state:
-    st.session_state.processed_files = []
+    # Environment variables configuration
+    QUARTR_API_KEY = get_env_variable("QUARTR_API_KEY")
+    AWS_ACCESS_KEY_ID = get_env_variable("AWS_ACCESS_KEY_ID")
+    AWS_SECRET_ACCESS_KEY = get_env_variable("AWS_SECRET_ACCESS_KEY")
+    AWS_DEFAULT_REGION = get_env_variable("AWS_DEFAULT_REGION")
+    DEFAULT_S3_BUCKET = get_env_variable("DEFAULT_S3_BUCKET")
+    REDIS_URL = get_env_variable("REDIS_URL")
 
-class QuartrAPI:
-    def __init__(self):
-        if not QUARTR_API_KEY:
-            raise ValueError("Quartr API key not found in environment variables")
-        self.api_key = QUARTR_API_KEY
-        self.base_url = "https://api.quartr.com/public/v1"
-        self.headers = {"X-Api-Key": self.api_key}
-        
-    async def get_company_events(self, isin: str, session: aiohttp.ClientSession) -> Dict:
-        url = f"{self.base_url}/companies/isin/{isin}"
-        try:
-            async with session.get(url, headers=self.headers) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    st.error(f"Error fetching data for ISIN {isin}: {response.status}")
-                    return {}
-        except Exception as e:
-            st.error(f"Error fetching data for ISIN {isin}: {str(e)}")
-            return {}
+    # Initialize session state
+    if "processing_complete" not in st.session_state:
+        st.session_state.processing_complete = False
+    if "processed_files" not in st.session_state:
+        st.session_state.processed_files = []
 
-class TranscriptProcessor:
-    @staticmethod
-    async def process_transcript(transcript_url: str, transcripts: Dict, session: aiohttp.ClientSession) -> str:
-        """Process transcript JSON into clean text"""
-        try:
-            raw_transcript_url = transcripts.get('transcriptUrl')
-            if not raw_transcript_url:
-                st.warning(f"No raw transcript URL found in transcripts object")
-                return ''
+    # Auto refresh when task is running
+    if "task_id" in st.session_state:
+        st_autorefresh(interval=10000)  # Refresh every 10 seconds
 
-            async with session.get(raw_transcript_url) as response:
-                if response.status == 200:
-                    if 'application/json' in response.headers.get('Content-Type', ''):
-                        try:
-                            transcript_data = await response.json()
-                            text = transcript_data.get('transcript', {}).get('text', '')
-                            sentences = text.split('. ')
-                            formatted_text = '.\n'.join(sentences)
-                            return formatted_text
-                        except json.JSONDecodeError:
-                            st.error(f"Error decoding transcript JSON from {raw_transcript_url}")
-                            return ''
-                    else:
-                        st.warning(f"Unexpected content type for transcript: {response.headers.get('Content-Type')}")
-                        return ''
-                else:
-                    st.warning(f"Failed to fetch transcript: {response.status}")
-                    return ''
-        except Exception as e:
-            st.warning(f"Error processing transcript: {str(e)}")
-            return ''
-
-    @staticmethod
-    def create_pdf(company_name: str, event_title: str, event_date: str, transcript_text: str) -> bytes:
-        """Create a PDF from transcript text"""
-        buffer = io.BytesIO()
-        
-        doc = SimpleDocTemplate(
-            buffer,
-            pagesize=letter,
-            rightMargin=72,
-            leftMargin=72,
-            topMargin=72,
-            bottomMargin=72
-        )
-
-        styles = getSampleStyleSheet()
-        
-        header_style = ParagraphStyle(
-            'CustomHeader',
-            parent=styles['Heading1'],
-            fontSize=14,
-            spaceAfter=30,
-            textColor=colors.HexColor('#1a472a'),
-            alignment=1
-        )
-        
-        text_style = ParagraphStyle(
-            'CustomText',
-            parent=styles['Normal'],
-            fontSize=10,
-            leading=14,
-            spaceBefore=6,
-            fontName='Helvetica'
-        )
-
-        story = []
-        
-        header_text = f"""
-            <para alignment="center">
-            <b>{company_name}</b><br/>
-            <br/>
-            Event: {event_title}<br/>
-            Date: {event_date}
-            </para>
-        """
-        story.append(Paragraph(header_text, header_style))
-        story.append(Spacer(1, 30))
-
-        paragraphs = transcript_text.split('\n')
-        for para in paragraphs:
-            if para.strip():
-                story.append(Paragraph(para, text_style))
-                story.append(Spacer(1, 6))
-
-        doc.build(story)
-        return buffer.getvalue()
-
-class S3Handler:
-    def __init__(self):
-        if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION]):
-            raise ValueError("AWS credentials not found in environment variables")
-        
-        self.session = aioboto3.Session(
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            region_name=AWS_DEFAULT_REGION
-        )
-
-    async def upload_file(self, file_data: bytes, filename: str, bucket_name: str, 
-                         content_type: str = 'application/pdf'):
-        """Modified upload_file to use flat structure without folders"""
-        try:
-            async with self.session.client('s3') as s3:
-                # Use only the filename as the key, without folder structure
-                await s3.put_object(
-                    Bucket=bucket_name,
-                    Key=filename,
-                    Body=file_data,
-                    ContentType=content_type
-                )
-                return True
-        except Exception as e:
-            st.error(f"Error uploading to S3: {str(e)}")
-            return False
-
-def create_filename(company_name: str, event_date: str, event_title: str, doc_type: str, original_filename: str) -> str:
-    """Create a flat filename structure"""
-    # Clean up company name and event title
-    clean_company = company_name.replace(" ", "_").replace("/", "_").lower()
-    clean_event = event_title.replace(" ", "_").lower()
-    clean_date = event_date.split("T")[0]
-    
-    # Get file extension from original filename
-    file_extension = original_filename.split('.')[-1].lower()
-    
-    # Create a flat filename
-    return f"{clean_company}_{clean_date}_{clean_event}_{doc_type}.{file_extension}"
-
-async def process_documents(isin_list: List[str], start_date: str, end_date: str, 
-                          selected_docs: List[str], bucket_name: str):
-    quartr = QuartrAPI()
-    s3_handler = S3Handler()
-    transcript_processor = TranscriptProcessor()
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    files_processed = st.empty()
-    
-    total_files = 0
-    processed_files = 0
-    successful_uploads = 0
-    failed_uploads = 0
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            # First validate all ISINs
-            valid_isins = []
-            for isin in isin_list:
-                company_data = await quartr.get_company_events(isin, session)
-                if company_data and 'events' in company_data:
-                    valid_isins.append(isin)
-                else:
-                    st.warning(f"Skipping invalid ISIN {isin}")
-            
-            if not valid_isins:
-                st.error("No valid ISINs found")
-                return
-                
-            # Continue with valid ISINs only
-            companies_data = []
-            for isin in valid_isins:
-                data = await quartr.get_company_events(isin, session)
-                if data:
-                    companies_data.append(data)
-            
-            # Calculate total files
-            for company in companies_data:
-                for event in company.get('events', []):
-                    event_date = event.get('eventDate', '').split('T')[0]
-                    if start_date <= event_date <= end_date:
-                        for doc_type in selected_docs:
-                            url_field = f'{doc_type}Url'
-                            if event.get(url_field):
-                                total_files += 1
-            
-            if total_files == 0:
-                st.warning("No matching documents found for the specified criteria.")
-                return
-                
-            # Process files
-            for company in companies_data:
-                if not company:
-                    continue
-                    
-                company_name = company.get('displayName', 'unknown')
-                
-                for event in company.get('events', []):
-                    event_date = event.get('eventDate', '').split('T')[0]
-                    event_title = event.get('eventTitle', 'Unknown Event')
-                    
-                    if start_date <= event_date <= end_date:
-                        for doc_type in selected_docs:
-                            url_field = f'{doc_type}Url'
-                            file_url = event.get(url_field)
-                            
-                            if file_url:
-                                success = False
-                                
-                                if doc_type == 'transcript':
-                                    # Handle transcript
-                                    transcripts = event.get('transcripts', {})
-                                    if transcripts:
-                                        transcript_text = await transcript_processor.process_transcript(
-                                            file_url,
-                                            transcripts,
-                                            session
-                                        )
-                                        if transcript_text:
-                                            pdf_bytes = transcript_processor.create_pdf(
-                                                company_name,
-                                                event_title,
-                                                event_date,
-                                                transcript_text
-                                            )
-                                            
-                                            filename = create_filename(
-                                                company_name,
-                                                event_date,
-                                                event_title,
-                                                doc_type,
-                                                'transcript.pdf'
-                                            )
-                                            
-                                            success = await s3_handler.upload_file(
-                                                pdf_bytes,
-                                                filename,
-                                                bucket_name
-                                            )
-                                elif doc_type == 'audio':
-                                    # Handle audio file
-                                    async with session.get(file_url) as response:
-                                        if response.status == 200:
-                                            content = await response.read()
-                                            file_extension = file_url.split('.')[-1].lower()
-                                            filename = create_filename(
-                                                company_name,
-                                                event_date,
-                                                event_title,
-                                                doc_type,
-                                                f"audio.{file_extension}"
-                                            )
-                                            content_type = 'audio/mpeg' if file_extension == 'mpeg' else 'audio/mp3'
-                                            success = await s3_handler.upload_file(
-                                                content,
-                                                filename,
-                                                bucket_name,
-                                                content_type
-                                            )
-                                else:
-                                    # Handle regular files (slides, reports)
-                                    async with session.get(file_url) as response:
-                                        if response.status == 200:
-                                            content = await response.read()
-                                            original_filename = file_url.split('/')[-1]
-                                            filename = create_filename(
-                                                company_name,
-                                                event_date,
-                                                event_title,
-                                                doc_type,
-                                                original_filename
-                                            )
-                                            success = await s3_handler.upload_file(
-                                                content,
-                                                filename,
-                                                bucket_name,
-                                                response.headers.get('content-type', 'application/pdf')
-                                            )
-                                
-                                if success:
-                                    successful_uploads += 1
-                                else:
-                                    failed_uploads += 1
-                                
-                                processed_files += 1
-                                progress = processed_files / total_files
-                                progress_bar.progress(progress)
-                                status_text.text(f"Processing: {processed_files}/{total_files} files")
-                                files_processed.text(
-                                    f"Successful uploads: {successful_uploads} | "
-                                    f"Failed uploads: {failed_uploads}"
-                                )
-                                
-                                await asyncio.sleep(0.1)
-            
-            progress_bar.progress(1.0)
-            status_text.text("Processing complete!")
-            files_processed.text(
-                f"Final results:\n"
-                f"Total files processed: {processed_files}\n"
-                f"Successful uploads: {successful_uploads}\n"
-                f"Failed uploads: {failed_uploads}"
-            )
-            
-            st.session_state.processing_complete = True
-            
-    except Exception as e:
-        st.error(f"An error occurred during processing: {str(e)}")
-        raise
-
-def main():
-    st.title("Quartr Data Retrieval and S3 Upload")
-    
-    # Validate environment variables
-    if not all([QUARTR_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION]):
-        st.error("""
-        Missing required environment variables. Please ensure the following are set in Railway:
-        - QUARTR_API_KEY
-        - AWS_ACCESS_KEY_ID
-        - AWS_SECRET_ACCESS_KEY
-        - AWS_DEFAULT_REGION
-        - DEFAULT_S3_BUCKET (optional)
-        """)
-        return
-    
-    # Example ISINs
-    st.sidebar.header("Help")
-    st.sidebar.markdown("""
-    ### Example ISINs:
-    - US5024413065 (LVMH ADR)
-    - FR0000121014 (LVMH)
-    - TH0809120700 (LVMH TH)
-    
-    Enter one ISIN per line in the input box.
-    """)
-    
-    with st.form(key="quartr_form"):
-        isin_input = st.text_area(
-            "Enter ISINs (one per line)",
-            help="Enter each ISIN on a new line. See sidebar for examples.",
-            height=100
-        )
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input(
-                "Start Date",
-                datetime(2024, 1, 1),
-                help="Select start date for document retrieval",
-                min_value=datetime(2000, 1, 1)
-            )
-        with col2:
-            end_date = st.date_input(
-                "End Date",
-                datetime(2024, 12, 31),
-                help="Select end date for document retrieval",
-                max_value=datetime(2025, 12, 31)
-            )
-        
-        # All document types selected by default
-        doc_types = st.multiselect(
-            "Select document types",
-            ["slides", "report", "transcript", "audio"],
-            default=["slides", "report", "transcript", "audio"],  # All types selected by default
-            help="Choose which types of documents to retrieve"
-        )
-        
-        s3_bucket = st.text_input(
-            "S3 Bucket Name",
-            value=DEFAULT_S3_BUCKET or "",
-            help="Enter the name of the S3 bucket for file upload"
-        )
-        
-        submitted = st.form_submit_button("Start Processing")
-        
-        if submitted:
-            if not isin_input or not s3_bucket or not doc_types:
-                st.error("Please fill in all required fields")
-                return
-            
-            if start_date > end_date:
-                st.error("Start date must be before end date")
-                return
-            
-            isin_list = [isin.strip() for isin in isin_input.split("\n") if isin.strip()]
-            
-            if not isin_list:
-                st.error("Please enter at least one valid ISIN")
-                return
-            
+    def check_task_status():
+        if "task_id" in st.session_state:
             try:
-                asyncio.run(process_documents(
-                    isin_list,
-                    start_date.strftime("%Y-%m-%d"),
-                    end_date.strftime("%Y-%m-%d"),
-                    doc_types,
-                    s3_bucket
-                ))
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
-                return
+                # Create persistent containers if they don't exist
+                if 'progress_container' not in st.session_state:
+                    st.session_state.progress_container = st.empty()
+                if 'status_container' not in st.session_state:
+                    st.session_state.status_container = st.empty()
+                if 'results_container' not in st.session_state:
+                    st.session_state.results_container = st.empty()
 
-if __name__ == "__main__":
-    main()
-    
+                # Get task result
+                result = huey.result(st.session_state.task_id)
+                
+                if result:
+                    if result.get('status') == 'In Progress':
+                        # Update progress bar
+                        total = result.get('total', 0)
+                        processed = result.get('processed', 0)
+                        progress = processed / total if total > 0 else 0
+                        st.session_state.progress_container.progress(progress)
+
+                        # Update status message
+                        st.session_state.status_container.text(
+                            f"Processing files: {processed}/{total}"
+                        )
+
+                        # Update results
+                        success = result.get('success', 0)
+                        failed = result.get('failed', 0)
+                        st.session_state.results_container.text(
+                            f"Successful uploads: {success}\n"
+                            f"Failed uploads: {failed}"
+                        )
+
+                    elif result.get('status') == 'Complete':
+                        # Show completed progress bar
+                        st.session_state.progress_container.progress(1.0)
+                        
+                        # Show completion message
+                        st.session_state.status_container.text("Processing complete!")
+                        
+                        # Show final results
+                        st.session_state.results_container.text(
+                            f"Final results:\n"
+                            f"Total files processed: {result.get('total', 0)}\n"
+                            f"Successful uploads: {result.get('success', 0)}\n"
+                            f"Failed uploads: {result.get('failed', 0)}"
+                        )
+                        
+                        # Clear task ID from session state
+                        del st.session_state["task_id"]
+
+                    elif result.get('status') == 'Failed':
+                        st.error(f"Processing failed: {result.get('error', 'Unknown error')}")
+                        del st.session_state["task_id"]
+
+            except Exception as e:
+                st.error(f"Error checking task status: {str(e)}")
+                if "task_id" in st.session_state:
+                    del st.session_state["task_id"]
+
+    def test_queue_connection():
+        """Test the queue connection with better error handling and feedback"""
+        try:
+            from tasks import ping
+            from huey.exceptions import TaskException
+            
+            with st.spinner('Testing queue connection...'):
+                # Enqueue the task
+                task = ping()
+                
+                # Wait for result with timeout
+                try:
+                    response = task.get(blocking=True, timeout=15)  # Increased timeout
+                    if response == "pong":
+                        return True, "Queue connection successful!"
+                    else:
+                        return False, f"Unexpected response from queue: {response}"
+                except TaskException as e:
+                    return False, f"Task execution failed: {str(e)}"
+                except TimeoutError:
+                    return False, "Queue connection timed out. Worker might be unavailable."
+        except Exception as e:
+            return False, f"Queue connection failed: {str(e)}"
+
+    @st.cache_data(ttl=60)
+    def health_check():
+        return "OK"
+
+    def init_routes():
+        if st.query_params.get("health") == "check":
+            st.write(health_check())
+            st.stop()
+
+    def main():
+        init_routes()
+        st.title("Quartr Data Retrieval and S3 Upload")
+
+        # Validate environment variables
+        if not all([
+            QUARTR_API_KEY,
+            AWS_ACCESS_KEY_ID,
+            AWS_SECRET_ACCESS_KEY,
+            AWS_DEFAULT_REGION,
+            REDIS_URL,
+        ]):
+            st.error("""
+            Missing required environment variables. Please ensure all required environment variables are set.
+            """)
+            return
+
+        # Check task status if task is running
+        check_task_status()
+
+        # Only show form if no task is running
+        if "task_id" not in st.session_state:
+            with st.form(key="quartr_form"):
+                isin_input = st.text_area(
+                    "Enter ISINs (one per line)",
+                    height=100,
+                )
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    start_date = st.date_input(
+                        "Start Date",
+                        datetime(2024, 1, 1),
+                        help="Select start date for document retrieval",
+                        min_value=datetime(2000, 1, 1),
+                    )
+                with col2:
+                    end_date = st.date_input(
+                        "End Date",
+                        datetime(2024, 12, 31),
+                        help="Select end date for document retrieval",
+                        max_value=datetime(2025, 12, 31),
+                    )
+
+                doc_types = st.multiselect(
+                    "Select document types",
+                    ["slides", "report", "transcript", "audio"],
+                    default=["slides", "report", "transcript", "audio"],
+                )
+
+                s3_bucket = st.text_input(
+                    "S3 Bucket Name",
+                    value=DEFAULT_S3_BUCKET or "",
+                )
+
+                submitted = st.form_submit_button("Start Processing")
+
+                if submitted:
+                    if not isin_input or not s3_bucket or not doc_types:
+                        st.error("Please fill in all required fields")
+                        return
+
+                    if start_date > end_date:
+                        st.error("Start date must be before end date")
+                        return
+
+                    isin_list = [isin.strip() for isin in isin_input.split("\n") if isin.strip()]
+                    if not isin_list:
+                        st.error("Please enter at least one valid ISIN")
+                        return
+
+                    try:
+                        # Start background task with Huey
+                        task = process_files_task(
+                            isin_list,
+                            start_date.strftime("%Y-%m-%d"),
+                            end_date.strftime("%Y-%m-%d"),
+                            doc_types,
+                            s3_bucket,
+                        )
+                        # Store task ID in session state
+                        st.session_state.task_id = task.id
+                        st.experimental_rerun()
+                    except Exception as e:
+                        st.error(f"An error occurred: {str(e)}")
+                        return
+
+        # Add Queue connection test button
+        if st.button("Test Queue Connection"):
+            success, message = test_queue_connection()
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
+
+    if __name__ == "__main__":
+        main()    
